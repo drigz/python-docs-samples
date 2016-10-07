@@ -14,26 +14,25 @@
 
 """Tic Tac Toe with the Firebase API"""
 
-import datetime
+import base64
 import json
 import os
 import re
+import time
 import urllib
 
-from Crypto.PublicKey import RSA
+
 import flask
 from flask import request
+from google.appengine.api import app_identity
 from google.appengine.api import users
 from google.appengine.ext import ndb
 import httplib2
-import jwt
-from oauth2client.service_account import ServiceAccountCredentials
+from oauth2client.client import GoogleCredentials
 
 
 _FIREBASE_CONFIG_TEMPLATE = '_firebase_config.html'
-_SERVICE_ACCOUNT_FILENAME = 'credentials.json'
 
-_CWD = os.path.dirname(__file__)
 _IDENTITY_ENDPOINT = ('https://identitytoolkit.googleapis.com/'
                       'google.identity.identitytoolkit.v1.IdentityToolkit')
 _FIREBASE_SCOPES = [
@@ -46,24 +45,28 @@ app = flask.Flask(__name__)
 
 def _get_firebase_config(key=re.compile(r'\bdatabaseURL\b.*?["\']([^"\']+)')):
     """Grabs a key from the Firebase config, defaulting to databaseURL."""
-    with open(os.path.join(_CWD, 'templates', _FIREBASE_CONFIG_TEMPLATE)) as f:
+    cwd = os.path.dirname(__file__)
+    with open(os.path.join(cwd, 'templates', _FIREBASE_CONFIG_TEMPLATE)) as f:
         match = next(key.search(line) for line in f if key.search(line))
     return match.group(1)
 
 
 def _send_firebase_message(u_id, message=None, _memo={}):
-    # Memoize the authorized http object, to avoid fetching new access tokens
     if 'http' not in _memo:
+        # Memoize the authorized http object, to avoid refetching access tokens
         http = httplib2.Http()
-        # Use service account credentials to make the Firebase calls
+        # Use application default credentials to make the Firebase calls
         # https://firebase.google.com/docs/reference/rest/database/user-auth
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            os.path.join(_CWD, _SERVICE_ACCOUNT_FILENAME), _FIREBASE_SCOPES)
+        creds = GoogleCredentials.get_application_default().create_scoped(
+            _FIREBASE_SCOPES)
         creds.authorize(http)
         _memo['http'] = http
 
+        # Memoize the databaseURL, to avoid re-parsing the code snippet
+        _memo['databaseURL'] = _get_firebase_config()
+
     http = _memo['http']
-    url = '{}/channels/{}.json'.format(_get_firebase_config(), u_id)
+    url = '{}/channels/{}.json'.format(_memo['databaseURL'], u_id)
 
     if message:
         return http.request(url, 'PATCH', body=message)
@@ -71,26 +74,30 @@ def _send_firebase_message(u_id, message=None, _memo={}):
         return http.request(url, 'DELETE')
 
 
-def create_custom_token(uid):
+def create_custom_token(uid, valid_minutes=60):
     """Create a secure token for the given id.
 
-    This method is used to create secure custom tokens to be passed to clients
-    it takes a unique id (uid) that will be used by Firebase's security rules
-    to prevent unauthorized access. In this case, the uid will be the channel
-    id which is a combination of user_id and game_key
+    This method is used to create secure custom JWT tokens to be passed to
+    clients. It takes a unique id (uid) that will be used by Firebase's
+    security rules to prevent unauthorized access. In this case, the uid will
+    be the channel id which is a combination of user_id and game_key
     """
-    with open(os.path.join(_CWD, _SERVICE_ACCOUNT_FILENAME), 'r') as f:
-        credentials = json.load(f)
+    header = base64.b64encode(json.dumps({'typ': 'JWT', 'alg': 'RS256'}))
 
-    payload = {
-        'iss': credentials['client_email'],
-        'sub': credentials['client_email'],
+    client_email = app_identity.get_service_account_name()
+    payload = base64.b64encode(json.dumps({
+        'iss': client_email,
+        'sub': client_email,
         'aud': _IDENTITY_ENDPOINT,
         'uid': uid,
-    }
-    exp = datetime.timedelta(minutes=60)
-    return jwt.generate_jwt(
-        payload, RSA.importKey(credentials['private_key']), 'RS256', exp)
+        'exp': int(time.time()) + (valid_minutes * 60),
+    }))
+
+    to_sign = '{}.{}'.format(header, payload)
+
+    # Sign the jwt
+    return '{}.{}'.format(to_sign, base64.b64encode(
+        app_identity.sign_blob(to_sign)[1]))
 
 
 class Wins():
